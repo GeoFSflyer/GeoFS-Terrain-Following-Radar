@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         GeoFS Terrain Follow Autopilot
 // @namespace    https://example.local/
-// @version      0.4.0
-// @description  Terrain-following altitude mode for GeoFS. Uses explicit ON/OFF toggle and locks from selected AP altitude.
+// @version      0.4.1
+// @description  Terrain-following altitude mode for GeoFS. Explicit ON/OFF toggle; locks from selected AP altitude.
 // @match        https://www.geo-fs.com/*
 // @match        https://geo-fs.com/*
 // @grant        none
 // ==/UserScript==
 
-(() => {
+(function () {
   'use strict';
 
   const FT_PER_M = 3.28084;
@@ -59,8 +59,8 @@
     return Math.max(lo, Math.min(hi, v));
   }
 
-  function round(n) {
-    return Math.round(n);
+  function round(v) {
+    return Math.round(v);
   }
 
   function mToFt(m) {
@@ -73,9 +73,11 @@
 
   function getByPath(obj, path) {
     let cur = obj;
-    for (const key of path) {
-      if (!cur || !(key in cur)) return undefined;
-      cur = cur[key];
+    for (let i = 0; i < path.length; i++) {
+      if (!cur || !(path[i] in cur)) {
+        return undefined;
+      }
+      cur = cur[path[i]];
     }
     return cur;
   }
@@ -84,7 +86,9 @@
     let cur = obj;
     for (let i = 0; i < path.length - 1; i++) {
       const key = path[i];
-      if (!cur[key] || typeof cur[key] !== 'object') cur[key] = {};
+      if (!cur[key] || typeof cur[key] !== 'object') {
+        cur[key] = {};
+      }
       cur = cur[key];
     }
     cur[path[path.length - 1]] = value;
@@ -92,15 +96,15 @@
   }
 
   function getViewer() {
-    return window.geofs?.api?.viewer || window.geofs?.viewer || null;
+    return (window.geofs && (window.geofs.api && window.geofs.api.viewer || window.geofs.viewer)) || null;
   }
 
   function getAircraft() {
-    return window.geofs?.aircraft?.instance || null;
+    return window.geofs && window.geofs.aircraft && window.geofs.aircraft.instance || null;
   }
 
   function getAutopilot() {
-    return window.geofs?.autopilot || null;
+    return window.geofs && window.geofs.autopilot || null;
   }
 
   function getAltitudeInput() {
@@ -113,7 +117,9 @@
 
   function getSelectedAltitudeFeetFromUI() {
     const el = getAltitudeInput();
-    if (!el) return null;
+    if (!el) {
+      return null;
+    }
     const raw = String(el.value || '').replace(/[^\d.-]/g, '');
     const v = Number(raw);
     return Number.isFinite(v) ? v : null;
@@ -121,7 +127,10 @@
 
   function setSelectedAltitudeFeetInUI(feet) {
     const el = getAltitudeInput();
-    if (!el) return false;
+    if (!el) {
+      return false;
+    }
+
     const v = String(Math.max(0, round(feet)));
     el.value = v;
     el.setAttribute('value', v);
@@ -131,17 +140,23 @@
   }
 
   function normalizeLLA(raw) {
-    if (!raw) return null;
+    if (!raw) {
+      return null;
+    }
 
     if (Array.isArray(raw) && raw.length >= 3) {
       const a = Number(raw[0]);
       const b = Number(raw[1]);
       const c = Number(raw[2]);
-      if (![a, b, c].every(Number.isFinite)) return null;
+
+      if (![a, b, c].every(Number.isFinite)) {
+        return null;
+      }
 
       if (Math.abs(a) <= 90 && Math.abs(b) <= 180) {
         return { lat: a, lon: b, altM: c };
       }
+
       if (Math.abs(a) <= 180 && Math.abs(b) <= 90) {
         return { lat: b, lon: a, altM: c };
       }
@@ -151,8 +166,9 @@
       const lat = Number(raw.lat ?? raw.latitude ?? raw[1]);
       const lon = Number(raw.lon ?? raw.lng ?? raw.longitude ?? raw[0]);
       const altM = Number(raw.alt ?? raw.altitude ?? raw.z ?? raw[2]);
+
       if ([lat, lon, altM].every(Number.isFinite)) {
-        return { lat, lon, altM };
+        return { lat: lat, lon: lon, altM: altM };
       }
     }
 
@@ -162,10 +178,7 @@
   function getLLA() {
     const ac = getAircraft();
     return normalizeLLA(
-      ac?.llaLocation ||
-      ac?.lla ||
-      ac?.location ||
-      ac?.position ||
+      (ac && (ac.llaLocation || ac.lla || ac.location || ac.position)) ||
       window.geofs?.animation?.values?.llaLocation ||
       window.geofs?.aircraft?.instance?.position
     );
@@ -174,42 +187,54 @@
   function getHeadingDeg() {
     const ac = getAircraft();
     const candidates = [
-      ac?.htr?.[0],
-      ac?.heading,
-      ac?.trueHeading,
+      ac && ac.htr && ac.htr[0],
+      ac && ac.heading,
+      ac && ac.trueHeading,
       window.geofs?.animation?.values?.heading,
       window.geofs?.animation?.values?.htr?.[0]
     ];
-    for (const v of candidates) {
-      const n = Number(v);
-      if (Number.isFinite(n)) return n;
+
+    for (let i = 0; i < candidates.length; i++) {
+      const n = Number(candidates[i]);
+      if (Number.isFinite(n)) {
+        return n;
+      }
     }
+
     return 0;
   }
 
   function getSpeedMps() {
     const ac = getAircraft();
     const candidates = [
-      ac?.groundSpeed,
-      ac?.trueAirSpeed,
-      ac?.tas,
+      ac && ac.groundSpeed,
+      ac && ac.trueAirSpeed,
+      ac && ac.tas,
       window.geofs?.animation?.values?.groundSpeed,
       window.geofs?.animation?.values?.trueAirSpeed
     ];
-    for (const v of candidates) {
-      const n = Number(v);
-      if (Number.isFinite(n) && n >= 0) return n;
+
+    for (let i = 0; i < candidates.length; i++) {
+      const n = Number(candidates[i]);
+      if (Number.isFinite(n) && n >= 0) {
+        return n;
+      }
     }
+
     return 0;
   }
 
   function getAutopilotTargetRaw() {
     const ap = getAutopilot();
-    if (!ap) return undefined;
+    if (!ap) {
+      return undefined;
+    }
 
-    for (const path of ALT_PATHS) {
-      const v = getByPath(ap, path);
-      if (Number.isFinite(v)) return v;
+    for (let i = 0; i < ALT_PATHS.length; i++) {
+      const v = getByPath(ap, ALT_PATHS[i]);
+      if (Number.isFinite(v)) {
+        return v;
+      }
     }
 
     return undefined;
@@ -217,14 +242,21 @@
 
   function detectAltitudeScale(rawTarget, currentAltM) {
     const uiFeet = getSelectedAltitudeFeetFromUI();
+
     if (Number.isFinite(uiFeet)) {
       const uiM = ftToM(uiFeet);
-      if (Math.abs(rawTarget - uiFeet) < 5) return FT_PER_M;
-      if (Math.abs(rawTarget - uiM) < 5) return 1;
+      if (Math.abs(rawTarget - uiFeet) < 5) {
+        return FT_PER_M;
+      }
+      if (Math.abs(rawTarget - uiM) < 5) {
+        return 1;
+      }
       return FT_PER_M;
     }
 
-    if (!Number.isFinite(rawTarget)) return FT_PER_M;
+    if (!Number.isFinite(rawTarget)) {
+      return FT_PER_M;
+    }
 
     const asMeters = rawTarget;
     const asFeetConverted = ftToM(rawTarget);
@@ -233,8 +265,12 @@
       const dMeters = Math.abs(asMeters - currentAltM);
       const dFeet = Math.abs(asFeetConverted - currentAltM);
 
-      if (dMeters < dFeet * 0.6) return 1;
-      if (dFeet < dMeters * 0.6) return FT_PER_M;
+      if (dMeters < dFeet * 0.6) {
+        return 1;
+      }
+      if (dFeet < dMeters * 0.6) {
+        return FT_PER_M;
+      }
     }
 
     return rawTarget > 8000 ? FT_PER_M : 1;
@@ -259,7 +295,9 @@
 
   function autopilotMasterOn() {
     const ap = getAutopilot();
-    if (!ap) return false;
+    if (!ap) {
+      return false;
+    }
 
     const flags = [
       ap.on,
@@ -284,21 +322,23 @@
         try {
           ap.setAltitude(rawTarget);
           wrote = true;
-        } catch (_) {}
+        } catch (e) {}
       }
 
-      for (const path of ALT_PATHS) {
+      for (let i = 0; i < ALT_PATHS.length; i++) {
         try {
-          setByPath(ap, path, rawTarget);
+          setByPath(ap, ALT_PATHS[i], rawTarget);
           wrote = true;
-        } catch (_) {}
+        } catch (e) {}
       }
 
-      for (const path of ALT_MODE_PATHS) {
+      for (let i = 0; i < ALT_MODE_PATHS.length; i++) {
         try {
-          const cur = getByPath(ap, path);
-          if (typeof cur === 'boolean') setByPath(ap, path, true);
-        } catch (_) {}
+          const cur = getByPath(ap, ALT_MODE_PATHS[i]);
+          if (typeof cur === 'boolean') {
+            setByPath(ap, ALT_MODE_PATHS[i], true);
+          }
+        } catch (e) {}
       }
     }
 
@@ -335,22 +375,29 @@
   async function getGroundElevationM(lat, lon) {
     const viewer = getViewer();
     const Cesium = window.Cesium;
-    if (!viewer || !Cesium) return null;
+
+    if (!viewer || !Cesium) {
+      return null;
+    }
 
     const carto = Cesium.Cartographic.fromDegrees(lon, lat);
 
     try {
       const sceneHeight = viewer.scene?.globe?.getHeight?.(carto);
-      if (Number.isFinite(sceneHeight)) return sceneHeight;
-    } catch (_) {}
+      if (Number.isFinite(sceneHeight)) {
+        return sceneHeight;
+      }
+    } catch (e) {}
 
     try {
       if (viewer.terrainProvider && Cesium.sampleTerrainMostDetailed) {
         const samples = await Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, [carto]);
-        const h = samples?.[0]?.height;
-        if (Number.isFinite(h)) return h;
+        const h = samples && samples[0] && samples[0].height;
+        if (Number.isFinite(h)) {
+          return h;
+        }
       }
-    } catch (_) {}
+    } catch (e) {}
 
     return null;
   }
@@ -367,17 +414,26 @@
       points.push(d === 0 ? { lat: lla.lat, lon: lla.lon } : offsetLatLon(lla.lat, lla.lon, hdg, d));
     }
 
-    const heights = await Promise.all(points.map(p => getGroundElevationM(p.lat, p.lon)));
-    const valid = heights.filter(Number.isFinite);
-    if (!valid.length) return null;
+    const heights = await Promise.all(
+      points.map(function (p) {
+        return getGroundElevationM(p.lat, p.lon);
+      })
+    );
 
-    return Math.max(...valid);
+    const valid = heights.filter(Number.isFinite);
+    if (!valid.length) {
+      return null;
+    }
+
+    return Math.max.apply(null, valid);
   }
 
   function setStatus(text) {
     state.status = text;
     const el = document.getElementById('tf-ap-status');
-    if (el) el.textContent = text;
+    if (el) {
+      el.textContent = text;
+    }
   }
 
   async function captureFromSelectedAltitude() {
@@ -404,13 +460,19 @@
 
   async function engageTerrainFollow() {
     const ok = await captureFromSelectedAltitude();
-    if (!ok) return;
+    if (!ok) {
+      return;
+    }
 
     state.enabled = true;
     setAutopilotTargetMeters(state.lastCommandedTargetM);
 
     setStatus(
-      `TF ON | ref ${round(state.lastCommandedTargetM)}m MSL | hold ${round(state.targetAglM)}m AGL`
+      'TF ON | ref ' +
+      round(state.lastCommandedTargetM) +
+      'm MSL | hold ' +
+      round(state.targetAglM) +
+      'm AGL'
     );
   }
 
@@ -423,7 +485,9 @@
   }
 
   async function tick() {
-    if (!state.enabled || state.busy) return;
+    if (!state.enabled || state.busy) {
+      return;
+    }
 
     if (!autopilotMasterOn()) {
       setStatus('TF ON, AP OFF');
@@ -472,7 +536,13 @@
 
       const currentAglM = lla.altM - groundM;
       setStatus(
-        `TF ON | hold ${round(state.targetAglM)}m AGL | now ${round(currentAglM)}m | cmd ${round(desiredCmdM)}m`
+        'TF ON | hold ' +
+        round(state.targetAglM) +
+        'm AGL | now ' +
+        round(currentAglM) +
+        'm | cmd ' +
+        round(desiredCmdM) +
+        'm'
       );
     } finally {
       state.busy = false;
@@ -480,23 +550,27 @@
   }
 
   function buildUI() {
+    if (document.getElementById('tf-ap-panel')) {
+      return;
+    }
+
     const wrap = document.createElement('div');
     wrap.id = 'tf-ap-panel';
-    wrap.style.cssText = `
-      position: fixed;
-      top: 110px;
-      right: 14px;
-      z-index: ${CFG.uiZ};
-      font: 12px/1.35 sans-serif;
-      color: #fff;
-      background: rgba(20,20,20,0.85);
-      border: 1px solid rgba(255,255,255,0.15);
-      border-radius: 8px;
-      padding: 10px;
-      min-width: 210px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
-      user-select: none;
-    `;
+    wrap.style.cssText = [
+      'position:fixed',
+      'top:110px',
+      'right:14px',
+      'z-index:' + CFG.uiZ,
+      'font:12px/1.35 sans-serif',
+      'color:#fff',
+      'background:rgba(20,20,20,0.85)',
+      'border:1px solid rgba(255,255,255,0.15)',
+      'border-radius:8px',
+      'padding:10px',
+      'min-width:210px',
+      'box-shadow:0 8px 24px rgba(0,0,0,0.3)',
+      'user-select:none'
+    ].join(';');
 
     const title = document.createElement('div');
     title.textContent = 'Terrain Follow AP';
@@ -509,23 +583,27 @@
 
     const toggle = document.createElement('button');
     toggle.textContent = 'Toggle (Alt+T)';
-    toggle.style.cssText = `
-      width: 100%;
-      padding: 7px 10px;
-      border: 0;
-      border-radius: 6px;
-      background: #0b84ff;
-      color: white;
-      cursor: pointer;
-      font-weight: 600;
-    `;
-    toggle.addEventListener('click', async () => {
-      if (state.enabled) disengageTerrainFollow();
-      else await engageTerrainFollow();
+    toggle.style.cssText = [
+      'width:100%',
+      'padding:7px 10px',
+      'border:0',
+      'border-radius:6px',
+      'background:#0b84ff',
+      'color:white',
+      'cursor:pointer',
+      'font-weight:600'
+    ].join(';');
+
+    toggle.addEventListener('click', async function () {
+      if (state.enabled) {
+        disengageTerrainFollow();
+      } else {
+        await engageTerrainFollow();
+      }
     });
 
     const note = document.createElement('div');
-    note.textContent = 'OFF: normal AP works normally. ON: selected AP altitude becomes terrain clearance reference.';
+    note.textContent = 'OFF: normal AP altitude selector is untouched. ON: selected AP altitude becomes terrain-clearance reference.';
     note.style.cssText = 'margin-top:8px;color:#ddd;';
 
     wrap.appendChild(title);
@@ -536,11 +614,14 @@
   }
 
   function bindHotkey() {
-    window.addEventListener('keydown', async (e) => {
+    window.addEventListener('keydown', async function (e) {
       if (e.altKey && e.code === CFG.hotkey) {
         e.preventDefault();
-        if (state.enabled) disengageTerrainFollow();
-        else await engageTerrainFollow();
+        if (state.enabled) {
+          disengageTerrainFollow();
+        } else {
+          await engageTerrainFollow();
+        }
       }
     });
   }
