@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GeoFS Terrain Follow Autopilot
 // @namespace    https://example.local/
-// @version      0.1.0
-// @description  Adds terrain-following altitude hold to GeoFS autopilot by keeping a constant AGL target.
+// @version      0.3.0
+// @description  Terrain-following altitude mode for GeoFS autopilot. Locks from selected AP altitude, then maintains that clearance above terrain.
 // @match        https://www.geo-fs.com/*
 // @match        https://geo-fs.com/*
 // @grant        none
@@ -11,13 +11,21 @@
 (() => {
   'use strict';
 
+  const FT_PER_M = 3.28084;
+
   const CFG = {
-    updateMs: 700,
-    minAglM: 60,
-    maxAglM: 4000,
-    maxTargetStepM: 45,
-    uiZ: 999999,
-    hotkey: 'KeyT'
+    updateMs: 600,
+    minAglM: 50,
+    maxAglM: 6000,
+    lookAheadSec: 10,
+    maxLookAheadM: 3500,
+    terrainSamples: 5,
+    maxStepUpM: 70,
+    maxStepDownM: 50,
+    captureBandM: 15,
+    hotkeyToggle: 'KeyT',
+    hotkeyRecapture: 'KeyR',
+    uiZ: 999999
   };
 
   const state = {
@@ -26,8 +34,8 @@
     targetAglM: null,
     lastGroundM: null,
     lastCommandedTargetM: null,
-    altitudeScale: 1,
-    status: 'OFF'
+    altitudeScale: FT_PER_M,
+    status: 'BOOTING'
   };
 
   const ALT_PATHS = [
@@ -50,6 +58,18 @@
 
   function clamp(v, lo, hi) {
     return Math.max(lo, Math.min(hi, v));
+  }
+
+  function round(n) {
+    return Math.round(n);
+  }
+
+  function mToFt(m) {
+    return m * FT_PER_M;
+  }
+
+  function ftToM(ft) {
+    return ft / FT_PER_M;
   }
 
   function getByPath(obj, path) {
@@ -80,19 +100,49 @@
     return window.geofs?.aircraft?.instance || null;
   }
 
+  function getAutopilot() {
+    return window.geofs?.autopilot || null;
+  }
+
+  function getAltitudeInput() {
+    return (
+      document.querySelector('input.geofs-autopilot-altitude') ||
+      document.querySelector('input[data-method="setAltitude"]') ||
+      document.querySelector('.geofs-autopilot input[data-method="setAltitude"]')
+    );
+  }
+
+  function getSelectedAltitudeFeetFromUI() {
+    const el = getAltitudeInput();
+    if (!el) return null;
+    const raw = String(el.value || '').replace(/[^\d.-]/g, '');
+    const v = Number(raw);
+    return Number.isFinite(v) ? v : null;
+  }
+
+  function setSelectedAltitudeFeetInUI(feet) {
+    const el = getAltitudeInput();
+    if (!el) return false;
+    const v = String(Math.max(0, round(feet)));
+    el.value = v;
+    el.setAttribute('value', v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }
+
   function normalizeLLA(raw) {
     if (!raw) return null;
+
     if (Array.isArray(raw) && raw.length >= 3) {
       const a = Number(raw[0]);
       const b = Number(raw[1]);
       const c = Number(raw[2]);
       if (![a, b, c].every(Number.isFinite)) return null;
 
-      // Try [lat, lon, alt]
       if (Math.abs(a) <= 90 && Math.abs(b) <= 180) {
         return { lat: a, lon: b, altM: c };
       }
-      // Try [lon, lat, alt]
       if (Math.abs(a) <= 180 && Math.abs(b) <= 90) {
         return { lat: b, lon: a, altM: c };
       }
@@ -138,50 +188,74 @@
     return 0;
   }
 
-  function getAutopilot() {
-    return window.geofs?.autopilot || null;
+  function getSpeedMps() {
+    const ac = getAircraft();
+    const candidates = [
+      ac?.groundSpeed,
+      ac?.trueAirSpeed,
+      ac?.tas,
+      window.geofs?.animation?.values?.groundSpeed,
+      window.geofs?.animation?.values?.trueAirSpeed
+    ];
+    for (const v of candidates) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) return n;
+    }
+    return 0;
   }
 
   function getAutopilotTargetRaw() {
     const ap = getAutopilot();
     if (!ap) return undefined;
+
     for (const path of ALT_PATHS) {
       const v = getByPath(ap, path);
       if (Number.isFinite(v)) return v;
     }
+
     return undefined;
   }
 
-  function detectAltitudeScale(currentAltM) {
-    const raw = getAutopilotTargetRaw();
-    if (!Number.isFinite(raw) || !Number.isFinite(currentAltM) || currentAltM < 1) return 1;
-    const ratio = raw / currentAltM;
-    if (ratio > 2.5 && ratio < 3.8) return 3.28084;
-    return 1;
+  function detectAltitudeScale(rawTarget, currentAltM) {
+    const uiFeet = getSelectedAltitudeFeetFromUI();
+    if (Number.isFinite(uiFeet)) {
+      const uiM = ftToM(uiFeet);
+      if (Math.abs(rawTarget - uiFeet) < 5) return FT_PER_M;
+      if (Math.abs(rawTarget - uiM) < 5) return 1;
+      return FT_PER_M;
+    }
+
+    if (!Number.isFinite(rawTarget)) return FT_PER_M;
+
+    const asMeters = rawTarget;
+    const asFeetConverted = ftToM(rawTarget);
+
+    if (Number.isFinite(currentAltM)) {
+      const dMeters = Math.abs(asMeters - currentAltM);
+      const dFeet = Math.abs(asFeetConverted - currentAltM);
+
+      if (dMeters < dFeet * 0.6) return 1;
+      if (dFeet < dMeters * 0.6) return FT_PER_M;
+    }
+
+    return rawTarget > 8000 ? FT_PER_M : 1;
   }
 
-  function setAutopilotTargetMeters(targetM) {
-    const ap = getAutopilot();
-    if (!ap) return false;
-
-    const rawTarget = targetM * state.altitudeScale;
-    let wrote = false;
-
-    for (const path of ALT_PATHS) {
-      try {
-        setByPath(ap, path, rawTarget);
-        wrote = true;
-      } catch (_) {}
+  function getSelectedAutopilotAltitudeM(currentAltM) {
+    const uiFeet = getSelectedAltitudeFeetFromUI();
+    if (Number.isFinite(uiFeet)) {
+      state.altitudeScale = FT_PER_M;
+      return ftToM(uiFeet);
     }
 
-    for (const path of ALT_MODE_PATHS) {
-      try {
-        const cur = getByPath(ap, path);
-        if (typeof cur === 'boolean') setByPath(ap, path, true);
-      } catch (_) {}
+    const raw = getAutopilotTargetRaw();
+    if (!Number.isFinite(raw)) {
+      state.altitudeScale = 1;
+      return currentAltM;
     }
 
-    return wrote;
+    state.altitudeScale = detectAltitudeScale(raw, currentAltM);
+    return raw / state.altitudeScale;
   }
 
   function autopilotMasterOn() {
@@ -200,27 +274,40 @@
     return flags.some(Boolean);
   }
 
-  async function getGroundElevationM(lat, lon) {
-    const viewer = getViewer();
-    const Cesium = window.Cesium;
-    if (!viewer || !Cesium) return null;
+  function setAutopilotTargetMeters(targetM) {
+    const ap = getAutopilot();
+    const rawTarget = targetM * state.altitudeScale;
+    const feetTarget = mToFt(targetM);
+    let wrote = false;
 
-    const carto = Cesium.Cartographic.fromDegrees(lon, lat);
-
-    try {
-      const sceneHeight = viewer.scene?.globe?.getHeight?.(carto);
-      if (Number.isFinite(sceneHeight)) return sceneHeight;
-    } catch (_) {}
-
-    try {
-      if (viewer.terrainProvider && Cesium.sampleTerrainMostDetailed) {
-        const samples = await Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, [carto]);
-        const h = samples?.[0]?.height;
-        if (Number.isFinite(h)) return h;
+    if (ap) {
+      if (typeof ap.setAltitude === 'function') {
+        try {
+          ap.setAltitude(rawTarget);
+          wrote = true;
+        } catch (_) {}
       }
-    } catch (_) {}
 
-    return null;
+      for (const path of ALT_PATHS) {
+        try {
+          setByPath(ap, path, rawTarget);
+          wrote = true;
+        } catch (_) {}
+      }
+
+      for (const path of ALT_MODE_PATHS) {
+        try {
+          const cur = getByPath(ap, path);
+          if (typeof cur === 'boolean') setByPath(ap, path, true);
+        } catch (_) {}
+      }
+    }
+
+    if (setSelectedAltitudeFeetInUI(feetTarget)) {
+      wrote = true;
+    }
+
+    return wrote;
   }
 
   function offsetLatLon(lat, lon, headingDeg, distanceM) {
@@ -246,72 +333,116 @@
     };
   }
 
-  async function getPredictedGroundM(lla) {
-    const ac = getAircraft();
-    const speedMps = Number(
-      ac?.groundSpeed ||
-      ac?.trueAirSpeed ||
-      window.geofs?.animation?.values?.groundSpeed ||
-      0
-    );
+  async function getGroundElevationM(lat, lon) {
+    const viewer = getViewer();
+    const Cesium = window.Cesium;
+    if (!viewer || !Cesium) return null;
 
-    const lookaheadM = clamp(speedMps * 6, 0, 2500);
-    if (lookaheadM < 50) {
-      return getGroundElevationM(lla.lat, lla.lon);
-    }
+    const carto = Cesium.Cartographic.fromDegrees(lon, lat);
 
-    const hdg = getHeadingDeg();
-    const p = offsetLatLon(lla.lat, lla.lon, hdg, lookaheadM);
+    try {
+      const sceneHeight = viewer.scene?.globe?.getHeight?.(carto);
+      if (Number.isFinite(sceneHeight)) return sceneHeight;
+    } catch (_) {}
 
-    const [hNow, hAhead] = await Promise.all([
-      getGroundElevationM(lla.lat, lla.lon),
-      getGroundElevationM(p.lat, p.lon)
-    ]);
+    try {
+      if (viewer.terrainProvider && Cesium.sampleTerrainMostDetailed) {
+        const samples = await Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, [carto]);
+        const h = samples?.[0]?.height;
+        if (Number.isFinite(h)) return h;
+      }
+    } catch (_) {}
 
-    if (Number.isFinite(hNow) && Number.isFinite(hAhead)) return Math.max(hNow, hAhead);
-    if (Number.isFinite(hNow)) return hNow;
-    if (Number.isFinite(hAhead)) return hAhead;
     return null;
   }
 
-  async function engageTerrainFollow() {
+  async function getPredictedGroundM(lla) {
+    const speedMps = getSpeedMps();
+    const hdg = getHeadingDeg();
+    const lookAheadM = clamp(speedMps * CFG.lookAheadSec, 150, CFG.maxLookAheadM);
+
+    const points = [];
+    for (let i = 0; i < CFG.terrainSamples; i++) {
+      const frac = CFG.terrainSamples === 1 ? 0 : i / (CFG.terrainSamples - 1);
+      const d = lookAheadM * frac;
+      points.push(d === 0 ? { lat: lla.lat, lon: lla.lon } : offsetLatLon(lla.lat, lla.lon, hdg, d));
+    }
+
+    const heights = await Promise.all(points.map(p => getGroundElevationM(p.lat, p.lon)));
+    const valid = heights.filter(Number.isFinite);
+    if (!valid.length) return null;
+
+    return Math.max(...valid);
+  }
+
+  function setStatus(text) {
+    state.status = text;
+    const el = document.getElementById('tf-ap-status');
+    if (el) el.textContent = text;
+  }
+
+  async function captureReferenceFromSelectedAltitude() {
     const lla = getLLA();
     if (!lla) {
       setStatus('NO POSITION');
-      return;
+      return false;
     }
 
     const groundM = await getPredictedGroundM(lla);
     if (!Number.isFinite(groundM)) {
       setStatus('NO TERRAIN');
-      return;
+      return false;
     }
 
-    state.altitudeScale = detectAltitudeScale(lla.altM);
-    state.lastGroundM = groundM;
-    state.targetAglM = clamp(lla.altM - groundM, CFG.minAglM, CFG.maxAglM);
-    state.lastCommandedTargetM = lla.altM;
-    state.enabled = true;
+    const apSelectedM = getSelectedAutopilotAltitudeM(lla.altM);
 
-    setAutopilotTargetMeters(lla.altM);
-    setStatus(`TF ON | target ${Math.round(state.targetAglM)}m AGL`);
+    state.lastGroundM = groundM;
+    state.targetAglM = clamp(apSelectedM - groundM, CFG.minAglM, CFG.maxAglM);
+    state.lastCommandedTargetM = apSelectedM;
+
+    return true;
+  }
+
+  async function engageTerrainFollow() {
+    const ok = await captureReferenceFromSelectedAltitude();
+    if (!ok) return;
+
+    state.enabled = true;
+    setAutopilotTargetMeters(state.lastCommandedTargetM);
+
+    setStatus(
+      `TF ON | ref ${round(state.lastCommandedTargetM)}m MSL | hold ${round(state.targetAglM)}m AGL`
+    );
+  }
+
+  async function recaptureReference() {
+    const wasEnabled = state.enabled;
+    const ok = await captureReferenceFromSelectedAltitude();
+    if (!ok) return;
+    state.enabled = wasEnabled || true;
+    setStatus(
+      `TF RECAPTURE | ref ${round(state.lastCommandedTargetM)}m MSL | hold ${round(state.targetAglM)}m AGL`
+    );
   }
 
   function disengageTerrainFollow() {
     state.enabled = false;
     state.targetAglM = null;
+    state.lastGroundM = null;
     state.lastCommandedTargetM = null;
     setStatus('TF OFF');
   }
 
   async function tick() {
     if (!state.enabled || state.busy) return;
+
     if (!autopilotMasterOn()) {
       setStatus('TF ARMED, AP OFF');
       return;
     }
 
     state.busy = true;
+
     try {
       const lla = getLLA();
       if (!lla) {
@@ -327,22 +458,32 @@
 
       state.lastGroundM = groundM;
 
-      let desiredMslM = groundM + state.targetAglM;
-      if (Number.isFinite(state.lastCommandedTargetM)) {
-        const delta = clamp(
-          desiredMslM - state.lastCommandedTargetM,
-          -CFG.maxTargetStepM,
-          CFG.maxTargetStepM
-        );
-        desiredMslM = state.lastCommandedTargetM + delta;
+      const desiredFromTerrainM = groundM + state.targetAglM;
+      const prevCmdM = state.lastCommandedTargetM;
+      const belowPrevCmd = Number.isFinite(prevCmdM) && lla.altM < (prevCmdM - CFG.captureBandM);
+
+      let desiredCmdM = desiredFromTerrainM;
+
+      if (Number.isFinite(prevCmdM)) {
+        if (belowPrevCmd) {
+          desiredCmdM = Math.max(desiredCmdM, prevCmdM);
+        }
+
+        const upper = prevCmdM + CFG.maxStepUpM;
+        const lower = belowPrevCmd ? prevCmdM : (prevCmdM - CFG.maxStepDownM);
+        desiredCmdM = clamp(desiredCmdM, lower, upper);
+
+        if (belowPrevCmd) {
+          desiredCmdM = Math.max(desiredCmdM, prevCmdM);
+        }
       }
 
-      state.lastCommandedTargetM = desiredMslM;
-      setAutopilotTargetMeters(desiredMslM);
+      state.lastCommandedTargetM = desiredCmdM;
+      setAutopilotTargetMeters(desiredCmdM);
 
-      const currentAgl = lla.altM - groundM;
+      const currentAglM = lla.altM - groundM;
       setStatus(
-        `TF ON | tgt ${Math.round(state.targetAglM)}m AGL | now ${Math.round(currentAgl)}m AGL`
+        `TF ON | hold ${round(state.targetAglM)}m AGL | now ${round(currentAglM)}m | cmd ${round(desiredCmdM)}m`
       );
     } finally {
       state.busy = false;
@@ -350,73 +491,98 @@
   }
 
   function buildUI() {
-    const wrap = document.createElement('div');
-    wrap.id = 'tf-ap-panel';
-    wrap.style.cssText = `
+    if (document.getElementById('tf-ap-panel')) return;
+
+    const panel = document.createElement('div');
+    panel.id = 'tf-ap-panel';
+    panel.style.cssText = `
       position: fixed;
       top: 110px;
       right: 14px;
       z-index: ${CFG.uiZ};
-      font: 12px/1.35 sans-serif;
-      color: #fff;
-      background: rgba(20,20,20,0.85);
-      border: 1px solid rgba(255,255,255,0.15);
-      border-radius: 8px;
+      width: 240px;
+      background: rgba(18, 22, 28, 0.88);
+      color: #eef6ff;
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 10px;
       padding: 10px;
-      min-width: 210px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+      font: 12px/1.35 Arial, sans-serif;
+      backdrop-filter: blur(6px);
       user-select: none;
     `;
 
     const title = document.createElement('div');
     title.textContent = 'Terrain Follow AP';
-    title.style.cssText = 'font-weight:700;margin-bottom:8px;';
+    title.style.cssText = 'font-weight:700; margin-bottom:8px;';
 
     const status = document.createElement('div');
     status.id = 'tf-ap-status';
     status.textContent = state.status;
-    status.style.cssText = 'margin-bottom:8px;color:#bfe7ff;';
+    status.style.cssText = 'min-height:34px; margin-bottom:8px; color:#bfe7ff;';
 
-    const toggle = document.createElement('button');
-    toggle.textContent = 'Toggle (Alt+T)';
-    toggle.style.cssText = `
-      width: 100%;
-      padding: 7px 10px;
-      border: 0;
-      border-radius: 6px;
-      background: #0b84ff;
-      color: white;
-      cursor: pointer;
-      font-weight: 600;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:8px;';
+
+    const btnToggle = document.createElement('button');
+    btnToggle.textContent = 'Toggle';
+    btnToggle.style.cssText = `
+      flex:1;
+      border:0;
+      border-radius:6px;
+      padding:8px 10px;
+      background:#0b84ff;
+      color:white;
+      font-weight:700;
+      cursor:pointer;
     `;
-    toggle.addEventListener('click', async () => {
+    btnToggle.addEventListener('click', async () => {
       if (state.enabled) disengageTerrainFollow();
       else await engageTerrainFollow();
     });
 
-    const note = document.createElement('div');
-    note.textContent = 'Locks current AGL and updates AP altitude target.';
-    note.style.cssText = 'margin-top:8px;color:#ddd;';
+    const btnRecapture = document.createElement('button');
+    btnRecapture.textContent = 'Recapture';
+    btnRecapture.style.cssText = `
+      flex:1;
+      border:0;
+      border-radius:6px;
+      padding:8px 10px;
+      background:#3d4b5c;
+      color:white;
+      font-weight:700;
+      cursor:pointer;
+    `;
+    btnRecapture.addEventListener('click', async () => {
+      await recaptureReference();
+    });
 
-    wrap.appendChild(title);
-    wrap.appendChild(status);
-    wrap.appendChild(toggle);
-    wrap.appendChild(note);
-    document.body.appendChild(wrap);
+    const help = document.createElement('div');
+    help.style.cssText = 'margin-top:8px; color:#d4dde8;';
+    help.textContent = 'Alt+T toggle, Alt+R recapture from selected AP altitude';
+
+    row.appendChild(btnToggle);
+    row.appendChild(btnRecapture);
+
+    panel.appendChild(title);
+    panel.appendChild(status);
+    panel.appendChild(row);
+    panel.appendChild(help);
+
+    document.body.appendChild(panel);
   }
 
-  function setStatus(text) {
-    state.status = text;
-    const el = document.getElementById('tf-ap-status');
-    if (el) el.textContent = text;
-  }
-
-  function bindHotkey() {
+  function bindHotkeys() {
     window.addEventListener('keydown', async (e) => {
-      if (e.altKey && e.code === CFG.hotkey) {
+      if (e.altKey && e.code === CFG.hotkeyToggle) {
         e.preventDefault();
         if (state.enabled) disengageTerrainFollow();
         else await engageTerrainFollow();
+      }
+
+      if (e.altKey && e.code === CFG.hotkeyRecapture) {
+        e.preventDefault();
+        await recaptureReference();
       }
     });
   }
@@ -427,12 +593,13 @@
 
   function bootstrap() {
     if (!ready()) {
+      setStatus('WAITING FOR GEOFS');
       setTimeout(bootstrap, 1000);
       return;
     }
 
     buildUI();
-    bindHotkey();
+    bindHotkeys();
     setInterval(tick, CFG.updateMs);
     setStatus('TF READY');
   }
